@@ -1,28 +1,33 @@
-import os
+# routes/camaras.py - Optimizado producción 40+ cámaras
 import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import threading
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from database import get_connection
-from torchvision import transforms, models
+from torchvision import models, transforms
 import logging
-import requests
+from collections import deque
+import numpy as np
+import time
 
+# ===================== ROUTER =====================
 router = APIRouter()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("camaras")
+
+# ===================== GPU =====================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ===================== MODELO =====================
 class FightDetectionModel(nn.Module):
     def __init__(self, hidden_dim=128, num_classes=2):
         super(FightDetectionModel, self).__init__()
-        # ResNet18 como extractor de features
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # sin fc final
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])
         self.lstm = nn.LSTM(input_size=512, hidden_size=hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, num_classes)
 
@@ -30,81 +35,119 @@ class FightDetectionModel(nn.Module):
         b, t, c, h, w = x.size()
         x = x.view(b * t, c, h, w)
         with torch.no_grad():
-            features = self.cnn(x).squeeze(-1).squeeze(-1)  # [b*t, 512]
-        features = features.view(b, t, -1)  # [b, t, 512]
+            features = self.cnn(x).squeeze(-1).squeeze(-1)
+        features = features.view(b, t, -1)
         lstm_out, _ = self.lstm(features)
         out = self.fc(lstm_out[:, -1, :])
         return out
 
 # ===================== CARGAR MODELO =====================
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = FightDetectionModel()
 try:
+    # Para máxima velocidad, si tienes TorchScript: model = torch.jit.load("fight_detection_model_scripted.pt").to(device)
+    model = FightDetectionModel().to(device)
     state_dict = torch.load("fight_detection_model.pth", map_location=device)
-    model.load_state_dict(state_dict, strict=False)  # ignora keys faltantes
-    model.to(device)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     logger.info("Modelo cargado correctamente")
 except Exception as e:
     logger.error(f"Error cargando modelo: {e}")
 
-# ===================== TRANSFORM =====================
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
 # ===================== GLOBAL =====================
-camara_frames = {}  # Último frame procesado por cámara
-camara_locks = {}   # Locks para acceso thread-safe
+camara_frames = {}     # último frame con overlay
+camara_locks = {}      # lock por cámara
+camara_buffers = {}    # buffer circular deque por cámara
+sequence_length = 16
+skip_frames = 2
 
-# ===================== FUNCIONES =====================
-def procesar_camara(camara_id: int, url: str):
+# ===================== TRANSFORM =====================
+preprocess_transform = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+
+def preprocess(frame):
+    frame = cv2.resize(frame, (224,224))
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_tensor = torch.tensor(frame/255., dtype=torch.float32).permute(2,0,1)
+    return preprocess_transform(frame_tensor)
+
+# ===================== HILOS DE CAPTURA =====================
+def procesar_camara(camara_id: int, url: str, resolution=(640,480)):
     cap = cv2.VideoCapture(url)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
     if not cap.isOpened():
-        logger.error(f"No se pudo abrir la cámara {camara_id}: {url}")
+        logger.error(f"No se pudo abrir la cámara {camara_id}")
         return
 
-    sequence_length = 16
-    buffer_frames = []
+    frame_count = 0
+    buffer = deque(maxlen=sequence_length)
+    camara_buffers[camara_id] = buffer
+    camara_locks[camara_id] = threading.Lock()
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            cap.release()
             logger.warning(f"Stream cerrado para cámara {camara_id}")
+            cap.release()
             break
+        frame_count += 1
+        if frame_count % skip_frames != 0:
+            continue
 
-        buffer_frames.append(frame)
-        if len(buffer_frames) > sequence_length:
-            buffer_frames.pop(0)
-
-        if len(buffer_frames) == sequence_length:
-            frames_tensor = torch.stack([transform(f) for f in buffer_frames])
-            frames_tensor = frames_tensor.unsqueeze(0).to(device)  # [1, seq_len, C, H, W]
-            with torch.no_grad():
-                outputs = model(frames_tensor)
-                probs = F.softmax(outputs, dim=1)
-                pred_class = torch.argmax(probs, dim=1).item()
-                label = "Pelea detectada" if pred_class == 1 else "Sin pelea"
-
-            frame_overlay = buffer_frames[-1].copy()
-            color = (0, 0, 255) if pred_class == 1 else (0, 255, 0)
-            cv2.putText(frame_overlay, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-            with camara_locks[camara_id]:
-                camara_frames[camara_id] = cv2.imencode('.jpg', frame_overlay)[1].tobytes()
+        buffer.append(preprocess(frame))
+        # Guardar último frame original para MJPEG
+        with camara_locks[camara_id]:
+            camara_frames[camara_id] = cv2.imencode('.jpg', frame)[1].tobytes()
 
 def iniciar_hilo_camara(camara_id: int, url: str):
-    if camara_id not in camara_locks:
-        camara_locks[camara_id] = threading.Lock()
-    t = threading.Thread(target=procesar_camara, args=(camara_id, url), daemon=True)
+    t = threading.Thread(target=procesar_camara, args=(camara_id,url), daemon=True)
     t.start()
-    logger.info(f"Hilo de procesamiento iniciado para cámara {camara_id}")
+    logger.info(f"Hilo de captura iniciado para cámara {camara_id}")
+
+# ===================== HILO DE INFERENCIA BATCH =====================
+def hilo_inferencia_batch():
+    while True:
+        batch = []
+        camaras_ready = []
+        for cam_id, buffer in camara_buffers.items():
+            with camara_locks[cam_id]:
+                if len(buffer) == sequence_length:
+                    batch.append(torch.stack(list(buffer)))
+                    camaras_ready.append(cam_id)
+
+        if batch:
+            frames_batch = torch.stack(batch).to(device)
+            with torch.no_grad():
+                outputs = model(frames_batch)
+                probs = F.softmax(outputs, dim=1)
+                preds = torch.argmax(probs, dim=1).cpu().numpy()
+
+            # actualizar overlay en frames
+            for cam_id, pred_class in zip(camaras_ready, preds):
+                label = "Pelea detectada" if pred_class else "Sin pelea"
+                with camara_locks[cam_id]:
+                    frame_bytes = camara_frames[cam_id]
+                    frame_array = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    color = (0,0,255) if pred_class else (0,255,0)
+                    cv2.putText(frame_array, label, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                    camara_frames[cam_id] = cv2.imencode('.jpg', frame_array)[1].tobytes()
+        time.sleep(0.01)  # evita 100% CPU
+
+# iniciar hilo batch
+inference_thread = threading.Thread(target=hilo_inferencia_batch, daemon=True)
+inference_thread.start()
+
+# ===================== MODELOS Pydantic =====================
+class Camara(BaseModel):
+    id: int
+    nombre: str
+    ubicacion: str
+    url_stream: str
+    estado: str
+
+class CamaraCrear(BaseModel):
+    nombre: str
+    ubicacion: str
+    url_stream: str
+    estado: str = "activa"
 
 # ===================== ENDPOINTS =====================
 @router.get("/camaras/{camara_id}/analizar_mjpeg")
@@ -132,24 +175,10 @@ def analizar_mjpeg(camara_id: int):
                     frame = camara_frames[camara_id]
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    
-    return StreamingResponse(mjpeg_generator(),
-                             media_type='multipart/x-mixed-replace; boundary=frame')
 
-# ===================== CRUD DE CÁMARAS =====================
-class Camara(BaseModel):
-    id: int
-    nombre: str
-    ubicacion: str
-    url_stream: str
-    estado: str
+    return StreamingResponse(mjpeg_generator(), media_type='multipart/x-mixed-replace; boundary=frame')
 
-class CamaraCrear(BaseModel):
-    nombre: str
-    ubicacion: str
-    url_stream: str
-    estado: str = "activa"
-
+# ===================== CRUD =====================
 @router.get("/camaras", response_model=list[Camara])
 def listar_camaras():
     db = get_connection()
