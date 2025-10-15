@@ -1,79 +1,142 @@
-
-import logging
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+import os
 import cv2
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import threading
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 from database import get_connection
+from torchvision import transforms, models
+import logging
 import requests
 
 router = APIRouter()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("camaras")
 
-# Endpoint proxy MJPEG para cámaras tipo IP Webcam
-@router.get("/camaras/{camara_id}/mjpeg")
-def proxy_mjpeg(camara_id: int, request: Request):
+# ===================== MODELO =====================
+class FightDetectionModel(nn.Module):
+    def __init__(self, hidden_dim=128, num_classes=2):
+        super(FightDetectionModel, self).__init__()
+        # ResNet18 como extractor de features
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # sin fc final
+        self.lstm = nn.LSTM(input_size=512, hidden_size=hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        b, t, c, h, w = x.size()
+        x = x.view(b * t, c, h, w)
+        with torch.no_grad():
+            features = self.cnn(x).squeeze(-1).squeeze(-1)  # [b*t, 512]
+        features = features.view(b, t, -1)  # [b, t, 512]
+        lstm_out, _ = self.lstm(features)
+        out = self.fc(lstm_out[:, -1, :])
+        return out
+
+# ===================== CARGAR MODELO =====================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = FightDetectionModel()
+try:
+    state_dict = torch.load("fight_detection_model.pth", map_location=device)
+    model.load_state_dict(state_dict, strict=False)  # ignora keys faltantes
+    model.to(device)
+    model.eval()
+    logger.info("Modelo cargado correctamente")
+except Exception as e:
+    logger.error(f"Error cargando modelo: {e}")
+
+# ===================== TRANSFORM =====================
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# ===================== GLOBAL =====================
+camara_frames = {}  # Último frame procesado por cámara
+camara_locks = {}   # Locks para acceso thread-safe
+
+# ===================== FUNCIONES =====================
+def procesar_camara(camara_id: int, url: str):
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        logger.error(f"No se pudo abrir la cámara {camara_id}: {url}")
+        return
+
+    sequence_length = 16
+    buffer_frames = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.release()
+            logger.warning(f"Stream cerrado para cámara {camara_id}")
+            break
+
+        buffer_frames.append(frame)
+        if len(buffer_frames) > sequence_length:
+            buffer_frames.pop(0)
+
+        if len(buffer_frames) == sequence_length:
+            frames_tensor = torch.stack([transform(f) for f in buffer_frames])
+            frames_tensor = frames_tensor.unsqueeze(0).to(device)  # [1, seq_len, C, H, W]
+            with torch.no_grad():
+                outputs = model(frames_tensor)
+                probs = F.softmax(outputs, dim=1)
+                pred_class = torch.argmax(probs, dim=1).item()
+                label = "Pelea detectada" if pred_class == 1 else "Sin pelea"
+
+            frame_overlay = buffer_frames[-1].copy()
+            color = (0, 0, 255) if pred_class == 1 else (0, 255, 0)
+            cv2.putText(frame_overlay, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+            with camara_locks[camara_id]:
+                camara_frames[camara_id] = cv2.imencode('.jpg', frame_overlay)[1].tobytes()
+
+def iniciar_hilo_camara(camara_id: int, url: str):
+    if camara_id not in camara_locks:
+        camara_locks[camara_id] = threading.Lock()
+    t = threading.Thread(target=procesar_camara, args=(camara_id, url), daemon=True)
+    t.start()
+    logger.info(f"Hilo de procesamiento iniciado para cámara {camara_id}")
+
+# ===================== ENDPOINTS =====================
+@router.get("/camaras/{camara_id}/analizar_mjpeg")
+def analizar_mjpeg(camara_id: int):
     db = get_connection()
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT url_stream, estado FROM camaras WHERE id=%s", (camara_id,))
     camara = cursor.fetchone()
     cursor.close()
     db.close()
+
     if not camara:
         raise HTTPException(status_code=404, detail="Cámara no encontrada")
     if camara.get("estado") == "inactiva":
-        raise HTTPException(status_code=403, detail="La cámara está desactivada")
+        raise HTTPException(status_code=403, detail="Cámara desactivada")
+
     url = camara["url_stream"]
-    # Asegurarse de que termina en /video
-    if url.endswith('/'):
-        url_video = url + 'video'
-    else:
-        url_video = url + '/video'
-    # Validar protocolo soportado
-    if not (url_video.startswith('http://') or url_video.startswith('https://')):
-        raise HTTPException(status_code=400, detail="Solo se soportan cámaras con URL http:// o https:// para transmisión MJPEG. Protocolo no soportado: " + url_video)
-    verify_ssl = not url_video.startswith('https://') or False
-    try:
-        r = requests.get(url_video, stream=True, verify=verify_ssl, timeout=5)
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=408, detail="La cámara no respondió a tiempo (timeout)")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error al conectar con la cámara: {str(e)}")
-    content_type = r.headers.get('Content-Type', 'multipart/x-mixed-replace; boundary=--myboundary')
-    def iter_mjpeg():
-        try:
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk:
-                    yield chunk
-        finally:
-            r.close()
-    return StreamingResponse(iter_mjpeg(), media_type=content_type)
+    if camara_id not in camara_frames:
+        iniciar_hilo_camara(camara_id, url)
 
-# Endpoint para consultar el estado de todas las cámaras
-@router.get("/camaras/estado")
-def estado_camaras():
-    db = get_connection()
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, nombre, url_stream FROM camaras")
-    camaras = cursor.fetchall()
-    cursor.close()
-    db.close()
-    resultado = []
-    for cam in camaras:
-        cap = cv2.VideoCapture(cam["url_stream"])
-        if cap.isOpened():
-            ret, _ = cap.read()
-            cap.release()
-            estado = "conectada" if ret else "desconectada"
-        else:
-            estado = "desconectada"
-        resultado.append({
-            "id": cam["id"],
-            "nombre": cam["nombre"],
-            "estado": estado
-        })
-    return resultado
+    def mjpeg_generator():
+        while True:
+            if camara_id in camara_frames:
+                with camara_locks[camara_id]:
+                    frame = camara_frames[camara_id]
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    
+    return StreamingResponse(mjpeg_generator(),
+                             media_type='multipart/x-mixed-replace; boundary=frame')
 
+# ===================== CRUD DE CÁMARAS =====================
 class Camara(BaseModel):
     id: int
     nombre: str
@@ -87,7 +150,6 @@ class CamaraCrear(BaseModel):
     url_stream: str
     estado: str = "activa"
 
-# Listar cámaras
 @router.get("/camaras", response_model=list[Camara])
 def listar_camaras():
     db = get_connection()
@@ -98,16 +160,14 @@ def listar_camaras():
     db.close()
     return camaras
 
-
-# Agregar cámara
 @router.post("/camaras")
-def agregar_camara(camara: dict):
+def agregar_camara(camara: CamaraCrear):
     db = get_connection()
     cursor = db.cursor()
     try:
         cursor.execute(
             "INSERT INTO camaras (nombre, ubicacion, url_stream, estado) VALUES (%s, %s, %s, %s)",
-            (camara["nombre"], camara["ubicacion"], camara["url_stream"], camara.get("estado", "activa"))
+            (camara.nombre, camara.ubicacion, camara.url_stream, camara.estado)
         )
         db.commit()
         return {"mensaje": "Cámara agregada correctamente"}
@@ -118,16 +178,14 @@ def agregar_camara(camara: dict):
         cursor.close()
         db.close()
 
-
-# Editar cámara
 @router.put("/camaras/{camara_id}")
-def editar_camara(camara_id: int, camara: dict):
+def editar_camara(camara_id: int, camara: CamaraCrear):
     db = get_connection()
     cursor = db.cursor()
     try:
         cursor.execute(
             "UPDATE camaras SET nombre=%s, ubicacion=%s, url_stream=%s, estado=%s WHERE id=%s",
-            (camara["nombre"], camara["ubicacion"], camara["url_stream"], camara.get("estado", "activa"), camara_id)
+            (camara.nombre, camara.ubicacion, camara.url_stream, camara.estado, camara_id)
         )
         db.commit()
         return {"mensaje": "Cámara actualizada correctamente"}
@@ -138,8 +196,6 @@ def editar_camara(camara_id: int, camara: dict):
         cursor.close()
         db.close()
 
-
-# Eliminar cámara
 @router.delete("/camaras/{camara_id}")
 def eliminar_camara(camara_id: int):
     db = get_connection()
@@ -155,61 +211,15 @@ def eliminar_camara(camara_id: int):
         cursor.close()
         db.close()
 
-# Probar conexión a cámara y obtener un frame
-@router.get("/camaras/{camara_id}/frame")
-def obtener_frame_camara(camara_id: int):
-    db = get_connection()
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT url_stream FROM camaras WHERE id=%s", (camara_id,))
-    camara = cursor.fetchone()
-    cursor.close()
-    db.close()
-    if not camara:
-        raise HTTPException(status_code=404, detail="Cámara no encontrada")
-    url = camara["url_stream"]
-    cap = cv2.VideoCapture(url)
-    if not cap.isOpened():
-        # Intentar obtener una imagen fija si es HTTP (muchas cámaras IP tipo Android solo dan /shot.jpg)
-        import requests
-        try:
-            if url.endswith('/'):
-                url_img = url + 'shot.jpg'
-            else:
-                url_img = url + '/shot.jpg'
-            resp = requests.get(url_img, timeout=3)
-            if resp.status_code == 200:
-                return StreamingResponse(iter([resp.content]), media_type="image/jpeg")
-            else:
-                raise HTTPException(status_code=400, detail=f"No se pudo conectar a la cámara ni obtener imagen fija: {resp.status_code}")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"No se pudo conectar a la cámara ni obtener imagen fija: {str(e)}")
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        raise HTTPException(status_code=400, detail="No se pudo obtener imagen de la cámara (stream abierto pero sin frame)")
-    _, img_encoded = cv2.imencode('.jpg', frame)
-    return StreamingResponse(
-        iter([img_encoded.tobytes()]),
-        media_type="image/jpeg"
-    )
-
-# Probar conexión a cámara (sin obtener frame)
-import logging
-
+# ===================== PROBAR CONEXIÓN =====================
 @router.get("/camaras/probar")
 def probar_camara(url: str):
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("camaras")
     logger.info(f"Intentando conectar a la cámara: {url}")
     cap = cv2.VideoCapture(url)
     if not cap.isOpened():
-        logger.error(f"No se pudo abrir la conexión con la cámara: {url}")
         return JSONResponse(content={"conectado": False, "mensaje": "No se pudo conectar"}, status_code=200)
     ret, frame = cap.read()
-    if not ret:
-        logger.error(f"No se pudo obtener imagen de la cámara: {url}")
-        cap.release()
-        return JSONResponse(content={"conectado": False, "mensaje": "No se pudo obtener imagen"}, status_code=200)
-    logger.info(f"Conexión exitosa y frame recibido de la cámara: {url}")
     cap.release()
+    if not ret:
+        return JSONResponse(content={"conectado": False, "mensaje": "No se pudo obtener imagen"}, status_code=200)
     return JSONResponse(content={"conectado": True, "mensaje": "Conexión exitosa"}, status_code=200)
