@@ -252,3 +252,5 @@ def probar_camara(url: str):
     if not ret:
         return JSONResponse(content={"conectado": False, "mensaje": "No se pudo obtener imagen"}, status_code=200)
     return JSONResponse(content={"conectado": True, "mensaje": "Conexión exitosa"}, status_code=200)
+
+
